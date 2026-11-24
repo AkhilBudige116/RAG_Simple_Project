@@ -1,28 +1,31 @@
 """
-Simple RAG Document Assistant
-=============================
+Simple RAG Document Assistant using LangChain
+=============================================
 A beginner-friendly Retrieval-Augmented Generation (RAG) app.
 
-Pipeline (all in this one file):
+LangChain pipeline:
     1. Upload   -> extract_text()
-    2. Chunk    -> split_text()
-    3. Embed    -> generate_embeddings()
-    4. Store    -> create_vector_store()      (FAISS, in memory)
-    5. Retrieve -> retrieve_relevant_chunks() (top 3)
-    6. Generate -> generate_answer()          (Groq LLM)
+    2. Chunk    -> RecursiveCharacterTextSplitter
+    3. Embed    -> HuggingFaceEmbeddings
+    4. Store    -> LangChain FAISS vector store (in memory)
+    5. Retrieve -> similarity_search_with_score()
+    6. Generate -> ChatGroq + LangChain prompt/parser chain
 
 Run with:  streamlit run app.py
 """
 
 import os
 
-import faiss
-import numpy as np
 import streamlit as st
 from dotenv import load_dotenv
-from groq import Groq
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_groq import ChatGroq
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
-from sentence_transformers import SentenceTransformer
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -72,85 +75,58 @@ def extract_text(uploaded_file):
 
 
 # -----------------------------------------------------------------------------
-# STEP 2: Text chunking
+# STEP 2: LangChain text chunking
 # -----------------------------------------------------------------------------
-def split_text(text, filename, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-    """Split text into overlapping chunks of roughly `chunk_size` characters.
-
-    Overlap keeps sentences that fall on a boundary intact in at least one chunk.
-    Each chunk is stored with its filename as metadata.
-    """
-    text = " ".join(text.split())  # collapse whitespace/newlines
-    chunks = []
-    step = chunk_size - overlap
-    for start in range(0, len(text), step):
-        piece = text[start:start + chunk_size].strip()
-        if piece:
-            chunks.append({"text": piece, "source": filename})
-        if start + chunk_size >= len(text):
-            break
-    return chunks
+def split_document(text, filename):
+    """Create LangChain Documents and split them while retaining source metadata."""
+    document = Document(
+        page_content=" ".join(text.split()),
+        metadata={"source": filename},
+    )
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+    )
+    return splitter.split_documents([document])
 
 
 # -----------------------------------------------------------------------------
-# STEP 3: Embeddings
+# STEP 3: LangChain embeddings
 # -----------------------------------------------------------------------------
 @st.cache_resource(show_spinner="Loading embedding model...")
 def load_embedding_model():
-    """Load the Sentence Transformer once and reuse it across reruns."""
-    return SentenceTransformer(EMBEDDING_MODEL_NAME)
-
-
-def generate_embeddings(texts):
-    """Convert a list of strings into a 2D numpy array of embeddings.
-
-    An embedding is a list of numbers (384 for MiniLM) that represents the
-    MEANING of a text. Texts with similar meaning get similar vectors, which
-    lets us search by meaning instead of exact keywords.
-    """
-    model = load_embedding_model()
-    embeddings = model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
-    return np.asarray(embeddings, dtype="float32")
+    """Load and cache LangChain's Hugging Face embedding integration."""
+    return HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL_NAME,
+        encode_kwargs={"normalize_embeddings": True},
+        query_encode_kwargs={"normalize_embeddings": True},
+        show_progress=False,
+    )
 
 
 # -----------------------------------------------------------------------------
-# STEP 4: Vector database (FAISS, in memory)
+# STEP 4: LangChain vector store (FAISS, in memory)
 # -----------------------------------------------------------------------------
-def create_vector_store(chunks):
-    """Embed all chunks and store them in a FAISS index.
-
-    We L2-normalise the vectors and use IndexFlatIP (inner product), which
-    makes the inner product equal to cosine similarity.
-    """
-    texts = [chunk["text"] for chunk in chunks]
-    embeddings = generate_embeddings(texts)
-    faiss.normalize_L2(embeddings)
-
-    index = faiss.IndexFlatIP(embeddings.shape[1])
-    index.add(embeddings)
-    return index  # chunk text + filenames are kept alongside in session state
+def create_vector_store(documents):
+    """Embed LangChain Documents and add them to an in-memory FAISS store."""
+    return FAISS.from_documents(documents, load_embedding_model())
 
 
 # -----------------------------------------------------------------------------
 # STEP 5: Retrieval
 # -----------------------------------------------------------------------------
-def retrieve_relevant_chunks(question, index, chunks, top_k=TOP_K):
-    """Embed the question and return the top_k most similar chunks."""
-    query_embedding = generate_embeddings([question])
-    faiss.normalize_L2(query_embedding)  # same normalisation as the chunks
-
-    k = min(top_k, index.ntotal)
-    scores, indices = index.search(query_embedding, k)
-
+def retrieve_relevant_chunks(question, index, top_k=TOP_K):
+    """Use the LangChain FAISS store to return the top matching source chunks."""
+    matches = index.similarity_search_with_score(question, k=top_k)
     results = []
-    for score, idx in zip(scores[0], indices[0]):
-        if idx == -1:
-            continue
+    for document, distance in matches:
+        # With normalized vectors, squared L2 distance maps to cosine similarity.
+        similarity = max(0.0, min(1.0, 1.0 - float(distance) / 2.0))
         results.append(
             {
-                "text": chunks[idx]["text"],
-                "source": chunks[idx]["source"],
-                "score": float(score),
+                "text": document.page_content,
+                "source": document.metadata.get("source", "Unknown"),
+                "score": similarity,
             }
         )
     return results
@@ -159,56 +135,49 @@ def retrieve_relevant_chunks(question, index, chunks, top_k=TOP_K):
 # -----------------------------------------------------------------------------
 # STEP 6: LLM answer generation (Groq)
 # -----------------------------------------------------------------------------
-def generate_answer(question, retrieved_chunks):
-    """Ask the Groq LLM to answer using ONLY the retrieved context."""
+def get_chat_model():
+    """Create a LangChain Groq chat model using the configured API key."""
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key or api_key == "your_groq_api_key_here":
         raise ValueError("GROQ_API_KEY is missing. Add your key to the .env file.")
+    return ChatGroq(api_key=api_key, model=LLM_MODEL_NAME, temperature=0, max_retries=2)
 
+
+def generate_answer(question, retrieved_chunks):
+    """Run a LangChain prompt/model/parser chain over retrieved context only."""
     context = "\n\n".join(
         f"[Source: {chunk['source']}]\n{chunk['text']}" for chunk in retrieved_chunks
     )
-
-    system_prompt = (
-        "You are a helpful document assistant. "
-        "Answer only using the provided context. If the answer is not available "
-        'in the context, reply exactly: "I couldn\'t find this information in your '
-        'uploaded documents." Do not guess or use outside knowledge.'
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                "You are a helpful document assistant. Answer only using the "
+                "provided context. If the answer is not available in the context, "
+                'reply exactly: "I couldn\'t find this information in your uploaded '
+                'documents." Do not guess or use outside knowledge.',
+            ),
+            ("human", "Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"),
+        ]
     )
-    user_prompt = f"Context:\n{context}\n\nQuestion: {question}\n\nAnswer:"
-
+    chain = prompt | get_chat_model() | StrOutputParser()
     try:
-        client = Groq(api_key=api_key)
-        response = client.chat.completions.create(
-            model=LLM_MODEL_NAME,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0,  # deterministic, avoids made-up details
-        )
-        return response.choices[0].message.content
+        return chain.invoke({"context": context, "question": question})
     except Exception as error:
         raise RuntimeError(f"Groq API error: {error}")
 
 
 def generate_general_answer(question):
-    """Ask Groq a general question without using uploaded documents."""
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key or api_key == "your_groq_api_key_here":
-        raise ValueError("GROQ_API_KEY is missing. Add your key to the .env file.")
-
+    """Run a LangChain chat chain without retrieving or using documents."""
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", "You are a helpful general-purpose AI assistant."),
+            ("human", "{question}"),
+        ]
+    )
+    chain = prompt | get_chat_model() | StrOutputParser()
     try:
-        client = Groq(api_key=api_key)
-        response = client.chat.completions.create(
-            model=LLM_MODEL_NAME,
-            messages=[
-                {"role": "system", "content": "You are a helpful general-purpose AI assistant."},
-                {"role": "user", "content": question},
-            ],
-            temperature=0,
-        )
-        return response.choices[0].message.content
+        return chain.invoke({"question": question})
     except Exception as error:
         raise RuntimeError(f"Groq API error: {error}")
 
@@ -217,8 +186,8 @@ def generate_general_answer(question):
 # Document processing (runs steps 1-4 when the button is clicked)
 # -----------------------------------------------------------------------------
 def process_documents(uploaded_files):
-    """Run extraction, chunking, embedding and indexing for all uploads."""
-    all_chunks = []
+    """Extract text, create LangChain chunks and index them for all uploads."""
+    all_documents = []
     processed_files = 0
 
     for uploaded_file in uploaded_files:
@@ -227,21 +196,21 @@ def process_documents(uploaded_files):
         except ValueError as error:
             st.sidebar.warning(str(error))
             continue
-        all_chunks.extend(split_text(text, uploaded_file.name))
+        all_documents.extend(split_document(text, uploaded_file.name))
         processed_files += 1
 
-    if not all_chunks:
+    if not all_documents:
         raise ValueError("No usable text found in the uploaded documents.")
 
     try:
-        index = create_vector_store(all_chunks)
+        index = create_vector_store(all_documents)
     except Exception as error:
         raise RuntimeError(f"Failed to build the vector store: {error}")
 
     st.session_state.index = index
-    st.session_state.chunks = all_chunks
+    st.session_state.chunks = all_documents
     st.session_state.num_docs = processed_files
-    st.session_state.num_chunks = len(all_chunks)
+    st.session_state.num_chunks = len(all_documents)
     st.session_state.messages = []  # new documents -> fresh conversation
 
 
@@ -356,7 +325,7 @@ def main():
                     return
                 with st.spinner("Searching documents and generating answer..."):
                     retrieved = retrieve_relevant_chunks(
-                        question, st.session_state.index, st.session_state.chunks
+                        question, st.session_state.index
                     )
                     if not retrieved:
                         answer = "I couldn't find this information in your uploaded documents."

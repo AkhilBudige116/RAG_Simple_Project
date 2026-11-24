@@ -74,7 +74,7 @@ Open the local URL printed by Streamlit, usually `http://localhost:8501`.
 
 ## How document retrieval works
 
-The app extracts text from PDF/TXT files, splits it into overlapping chunks, embeds each chunk with `sentence-transformers/all-MiniLM-L6-v2`, and stores normalized vectors in an in-memory FAISS index. For each question in Document Mode, it retrieves up to three similar chunks and sends those passages with the question to Groq. The configured Groq model is `openai/gpt-oss-120b`.
+The app extracts text from PDF/TXT files into LangChain `Document` objects, splits them into overlapping chunks with `RecursiveCharacterTextSplitter`, embeds each chunk with `HuggingFaceEmbeddings` using `sentence-transformers/all-MiniLM-L6-v2`, and stores normalized vectors in LangChain's FAISS vector store. For each question in Document Mode, FAISS retrieves up to three similar chunks, and a LangChain prompt/model/parser chain sends those passages and the question to Groq through `ChatGroq`. The configured Groq model is `openai/gpt-oss-120b`. General AI Mode uses a separate LangChain chat chain and skips retrieval.
 
 ## Project layout
 
